@@ -1,0 +1,30 @@
+defaults:
+  - base
+
+dataset:
+  name: metr-la
+  scenario: point
+  
+# Model hyperparameters:
+config : 
+  # Base PriSTI hyperparameters
+  layers: 1
+  channels: 16
+  nheads: 2
+  diffusion_embedding_dim: 64
+  is_adp: false
+  proj_t: 32
+  is_cross_t: true
+  is_cross_s: true
+  adj_file: ${dataset.name}
+  side_dim: 144
+  scale_window_factor: 1
+  batch_size: 4
+
+missing_pattern:
+  strategy1: point
+  strategy2: null
+
+hydra:
+  run:
+    dir: ./results/${model_name}_${dataset.name}_${dataset.scenario}_x${config.scale_window_factor}/
