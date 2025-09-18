@@ -4,7 +4,6 @@ from copy import deepcopy
 from omegaconf import open_dict
 from torch import Tensor
 
-
 from contextlib import nullcontext
 from tsl.engines.imputer import Imputer
 from tsl.metrics import torch as torch_metrics
@@ -13,12 +12,14 @@ from src.models.csdi import CSDI
 from src.models.pristi import PriSTI
 from src.models.timba import TIMBA
 
-from src.data.data_handlers import RandomStack, SchedulerPriSTI, MissingPatternHandler, create_interpolation, redefine_eval_mask
+from src.data.data_handlers import RandomStack, SchedulerPriSTI, MissingPatternHandler, create_interpolation, \
+    redefine_eval_mask
 
 from schedulefree import AdamWScheduleFree
 from torch_ema import ExponentialMovingAverage
 
 from src.utils import print_summary_model
+
 
 class DiffusionImputer(Imputer):
     def __init__(self, *args, **kwargs):
@@ -29,7 +30,7 @@ class DiffusionImputer(Imputer):
 
         scheduler_kwargs = kwargs['model_kwargs'].pop('scheduler_kwargs')
         self.num_T = scheduler_kwargs['num_train_timesteps']
-        
+
         self.t_sampler = RandomStack(self.num_T, dtype_int=True)
         self.scheduler = SchedulerPriSTI(**scheduler_kwargs)
 
@@ -46,25 +47,26 @@ class DiffusionImputer(Imputer):
         elif model_name == 'timba':
             model_class = TIMBA
 
-        self.model = model_class(config = model_hyperparams)
+        self.model = model_class(config=model_hyperparams)
 
         self.use_ema = self.model_kwargs['use_ema']
-        self.ema = ExponentialMovingAverage(self.parameters(), decay=self.model_kwargs['decay']) if self.use_ema else None
+        self.ema = ExponentialMovingAverage(self.parameters(),
+                                            decay=self.model_kwargs['decay']) if self.use_ema else None
 
         self.missing_pattern_handler = MissingPatternHandler(
-            strategy1=self.model_kwargs['missing_pattern']['strategy1'], 
-            strategy2=self.model_kwargs['missing_pattern']['strategy2'], 
+            strategy1=self.model_kwargs['missing_pattern']['strategy1'],
+            strategy2=self.model_kwargs['missing_pattern']['strategy2'],
             hist_patterns=self.model_kwargs['hist_patterns'],
             seq_len=model_hyperparams['time_steps']
-            )
+        )
 
         print_summary_model(self.model, model_hyperparams)
-        
+
     def get_imputation(self, batch):
         mask_co = batch.mask
 
         x_ta_t, cond_info, _ = self.scheduler.prepare_data(batch)
-        
+
         for i in reversed(range(self.num_T)):
             t = (torch.ones(x_ta_t.shape[0]) * i).to(x_ta_t.device)
             noise_pred = self.model(x_ta_t, cond_info['x_co'], cond_info['mask_co'], t)
@@ -72,14 +74,14 @@ class DiffusionImputer(Imputer):
 
         x_0 = batch.transform['x'].inverse_transform(x_ta_t)
         return x_0
-    
+
     def calculate_loss(self, batch, t=None):
         mask_ta = batch.eval_mask
 
         t = self.t_sampler.get(mask_ta.shape[0]).to(mask_ta.device) if t is None else t
-        x_ta_t, cond_info, noise = self.scheduler.prepare_data(batch,t=t)
+        x_ta_t, cond_info, noise = self.scheduler.prepare_data(batch, t=t)
 
-        noise_pred  = self.model(x_ta_t, cond_info['x_co'], cond_info['mask_co'], t)
+        noise_pred = self.model(x_ta_t, cond_info['x_co'], cond_info['mask_co'], t)
 
         return self.loss_fn(noise, noise_pred, mask_ta)
 
@@ -87,7 +89,7 @@ class DiffusionImputer(Imputer):
         loss = self.calculate_loss(batch)
         self.log_loss('train', loss, batch_size=batch.batch_size)
         return loss
-    
+
     def validation_step(self, batch, batch_idx):
         with self.ema.average_parameters() if self.use_ema else nullcontext():
             loss = torch.zeros(1).to(batch.x.device)
@@ -113,7 +115,7 @@ class DiffusionImputer(Imputer):
         x_t = self.generate_median_imputation(batch)
         print(time.time() - t)
         print(self.masked_mae(x_t, batch.y, batch.eval_mask))
-        
+
         self.test_metrics.update(x_t, batch.y, batch.eval_mask)
         self.log_metrics(self.test_metrics, batch_size=batch.batch_size)
 
@@ -122,18 +124,18 @@ class DiffusionImputer(Imputer):
         x_imputed = self.generate_median_imputation(batch)
         x_imputed = torch.where(batch.og_mask, batch.y, x_imputed)
         return x_imputed
-    
+
     def test_step_virtual_sensing(self, batch, masked_sensors):
         batch = create_interpolation(batch)
 
-        dict_sensors = {i:0 for i in masked_sensors}
+        dict_sensors = {i: 0 for i in masked_sensors}
         res = {
             'mae': dict_sensors,
             'mse': deepcopy(dict_sensors)
-            }
+        }
 
         x_t = self.generate_median_imputation(batch)
-        
+
         for sensor in masked_sensors:
             eval_mask = batch.eval_mask[:, :, sensor, :]
             y = batch.y[:, :, sensor, :]
@@ -189,7 +191,7 @@ class DiffusionImputer(Imputer):
             if self.ema.shadow_params[0].device != self.device:
                 self.ema.to(self.device)
 
-    def on_train_batch_end(self, *args, **kwargs)-> None:
+    def on_train_batch_end(self, *args, **kwargs) -> None:
         super().on_train_batch_end(*args, **kwargs)
         if self.use_ema:
             self.ema.update()
@@ -206,4 +208,3 @@ class DiffusionImputer(Imputer):
 
     def parameters(self):
         return self.model.parameters()
-    
