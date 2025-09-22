@@ -272,9 +272,9 @@ class HdMixer1(nn.Module):
         self.deform_patch = deform_patch
 
         # 设置补丁参数
-        self.patch_len = 207
-        self.stride = 207
-        context_window = 24 * 207
+        self.patch_len = 4
+        self.stride = 4
+        context_window = 24
         self.patch_num = context_window // self.stride
 
         # 可变形补丁相关参数
@@ -299,12 +299,12 @@ class HdMixer1(nn.Module):
 
         # 嵌入层
         self.embed_layer = nn.Embedding(num_embeddings=self.num_nodes, embedding_dim=16)
-        self.n_vars = 2  # 可以根据需要调整
+        self.n_vars = self.num_nodes  # 可以根据需要调整
 
     def forward(self, x):
         B, _, K, L = x.shape
-        batch_size = x.shape[0]
-        x = x.reshape(B, _, K * L)
+        batch_size = x.shape[0] * 2
+        x = x.reshape(B * _, K, L)
         seq_len = x.shape[-1]
 
         # 生成可变形补丁的偏移量
@@ -322,16 +322,13 @@ class HdMixer1(nn.Module):
         x = x.reshape(batch_size * self.n_vars, 1, 1, seq_len)
 
         # 使用双线性采样提取补丁
-        patch = F.grid_sample(
+        x = F.grid_sample(
             x,
             sampling_location_2d,
             mode='bilinear',
             padding_mode='border',
             align_corners=False
         ).squeeze(1)  # B*C, self.patch_num, self.patch_len
-
-        # 重塑输出
-        x = patch.reshape(batch_size, self.n_vars, self.patch_num, self.patch_len).permute(0, 1, 3, 2)
         return x
 
     class HdMixer2(nn.Module):
@@ -442,7 +439,6 @@ class TIMBA(nn.Module):
         self.r = config.get("r", 0.2)
 
         self.side_info = SideInfo(self.time_steps, self.num_nodes)
-
         # 修改HdMixer1初始化以包含可变形补丁参数
         self.hdmixer = HdMixer1(
             self.time_steps,
@@ -529,8 +525,10 @@ class TIMBA(nn.Module):
     def forward(self, x, itp_x, u, diffusion_step):
         if self.is_itp:
             x = torch.cat([x, itp_x], dim=-1)
-        x = x.permute(0, 3, 2, 1)  # B, input_dim, K, L
+        x = x.permute(0, 3, 2, 1)
+        B, inputdim, K, L = x.shape  # B, input_dim, K, L
         x = self.hdmixer(x)
+        x = x.reshape(B, inputdim, K, L)
         side_info = self.side_info(x)
         B, inputdim, K, L = x.shape
 
