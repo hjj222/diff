@@ -3,9 +3,8 @@ import time
 import random
 import numpy as np
 import pandas as pd
-import numpy as np
 from omegaconf import open_dict
-
+import sys
 import torch
 from schedulefree import AdamWScheduleFree
 from torch.optim import Adam
@@ -18,20 +17,14 @@ from tsl.metrics import torch as torch_metrics
 from src.data.traffic import MetrLADataset, PemsBayDataset
 from src.data.airquality import AQI36Dataset
 from src.data.mimiciii import MimicIIIDataset
-from src.models.diffusion import DiffusionImputer
+from src.models.diffusion import DeformableDiffusionImputer
 from pathlib import Path
 
 from torch_geometric.data import Data
 from copy import deepcopy
+from torch.utils.data import DataLoader, Dataset
 from src.data.data_handlers import create_interpolation  # 数据插值工具函数
-import os
-import time
-import random
-import numpy as np
-import torch
 import matplotlib.pyplot as plt
-from omegaconf import open_dict
-import copy
 
 
 class Experiment:
@@ -48,6 +41,11 @@ class Experiment:
             (torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu"))
         self.seed = seed
 
+        # 节点替换配置 - 仅用于测试集
+        self.replace_test_node = True  # 是否启用测试集节点替换
+        self.replace_from = 8  # 被替换的节点
+        self.replace_to = 9  # 替换为的节点
+
         # 固定随机种子
         torch.manual_seed(self.seed)
         torch.cuda.manual_seed(self.seed)
@@ -56,18 +54,53 @@ class Experiment:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-        # 【优化1：更基础的字体配置】确保所有环境兼容
-        plt.rcParams["font.family"] = ["monospace", "sans-serif"]  # 最基础的字体族
-        plt.rcParams["font.sans-serif"] = ["DejaVu Sans", "Courier New", "monospace"]  # 兼容性优先
+        # 字体配置
+        plt.rcParams["font.family"] = ["monospace", "sans-serif"]
+        plt.rcParams["font.sans-serif"] = ["DejaVu Sans", "Courier New", "monospace"]
         plt.rcParams["axes.unicode_minus"] = False
-        plt.rcParams["figure.dpi"] = 80  # 降低默认分辨率
-        plt.rcParams["savefig.dpi"] = 200  # 保存图像分辨率适中即可
-        plt.rcParams["axes.titlesize"] = 10  # 缩小标题字体
-        plt.rcParams["axes.labelsize"] = 8  # 缩小坐标轴标签
-        plt.rcParams["legend.fontsize"] = 7  # 缩小图例字体
+        plt.rcParams["figure.dpi"] = 80
+        plt.rcParams["savefig.dpi"] = 200
+        plt.rcParams["axes.titlesize"] = 10
+        plt.rcParams["axes.labelsize"] = 8
+        plt.rcParams["legend.fontsize"] = 7
+
+    def _replace_test_nodes(self, batch):
+        """在数据层面替换测试集节点：将replace_from节点的数据替换为replace_to节点的数据"""
+        if not self.replace_test_node:
+            return batch
+
+        # 处理列表类型的batch（如果原始数据是列表）
+        if isinstance(batch, list):
+            return [self._replace_test_nodes(item) for item in batch]
+
+        # 处理字典类型的batch
+        if isinstance(batch, dict):
+            batch_copy = batch.copy()
+            if 'x' in batch_copy and batch_copy['x'].size(-2) > max(self.replace_from, self.replace_to):
+                batch_copy['x'][..., self.replace_from, :] = batch_copy['x'][..., self.replace_to, :].clone()
+            if 'mask' in batch_copy and batch_copy['mask'].size(-2) > max(self.replace_from, self.replace_to):
+                batch_copy['mask'][..., self.replace_from, :] = batch_copy['mask'][..., self.replace_to, :].clone()
+            if 'y' in batch_copy and batch_copy['y'].size(-2) > max(self.replace_from, self.replace_to):
+                batch_copy['y'][..., self.replace_from, :] = batch_copy['y'][..., self.replace_to, :].clone()
+            return batch_copy
+
+        # 处理对象类型的batch（如包含input和target属性）
+        if hasattr(batch, 'input') and hasattr(batch.input, 'x'):
+            if batch.input.x.size(-2) > max(self.replace_from, self.replace_to):
+                # 替换输入数据中的节点
+                batch.input.x[..., self.replace_from, :] = batch.input.x[..., self.replace_to, :].clone()
+
+                # 替换掩码中的节点
+                if hasattr(batch.input, 'mask'):
+                    batch.input.mask[..., self.replace_from, :] = batch.input.mask[..., self.replace_to, :].clone()
+
+                # 替换目标数据中的节点
+                if hasattr(batch.target, 'y'):
+                    batch.target.y[..., self.replace_from, :] = batch.target.y[..., self.replace_to, :].clone()
+
+        return batch
 
     def prepare_data(self):
-        # 保持原有代码不变
         dm_params = {
             'batch_size': self.cfg.config.batch_size,
             'scale_window_factor': self.cfg.config.scale_window_factor
@@ -102,12 +135,56 @@ class Experiment:
             self.cfg.config.time_steps = self.dm.window
             self.cfg.config.num_nodes = self.dm.n_nodes
 
+        # 准备训练集和验证集加载器（不做节点替换）
         self.train_dataloader = self.dm.train_dataloader()
         self.val_dataloader = self.dm_stride.val_dataloader()
+
+        # 直接使用原始测试集加载器，不改变其类型和格式
         self.test_dataloader = self.dm_stride.test_dataloader()
 
+        if self.replace_test_node:
+            print(f"将在获取测试集数据时替换节点: {self.replace_from} -> {self.replace_to}")
+            print(f"保持原始测试集加载器类型: {type(self.test_dataloader).__name__}")
+        else:
+            print("未启用测试集节点替换")
+
+    def _wrap_dataloader_for_replacement(self, dataloader):
+        """创建数据加载器的包装器，在获取数据时进行节点替换但不改变原格式"""
+        if not self.replace_test_node:
+            return dataloader
+
+        # 定义迭代器包装器
+        class ReplacementIterator:
+            def __init__(self, iterator, replace_fn):
+                self.iterator = iterator
+                self.replace_fn = replace_fn
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                batch = next(self.iterator)
+                return self.replace_fn(batch)
+
+        # 定义加载器包装器，保持原有类型和属性
+        class ReplacementDataLoader(type(dataloader)):
+            def __init__(self, dataloader, replace_fn):
+                # 复制原始加载器的所有属性
+                self.__dict__ = dataloader.__dict__.copy()
+                self.replace_fn = replace_fn
+
+            def __iter__(self):
+                original_iterator = super().__iter__()
+                return ReplacementIterator(original_iterator, self.replace_fn)
+
+            # 保持长度不变
+            def __len__(self):
+                return len(super())
+
+        # 返回包装后的加载器，保持原始类型
+        return ReplacementDataLoader(dataloader, self._replace_test_nodes)
+
     def prepare_optimizer(self):
-        # 保持原有代码不变
         if self.optimizer_type == 0:
             self.optimizer = Adam
             self.optimizer_kwargs = {'lr': 1e-3, 'weight_decay': 1e-6}
@@ -135,7 +212,6 @@ class Experiment:
             raise ValueError(f"Unsupported optimizer type: {self.optimizer_type}")
 
     def prepare_model(self):
-        # 保持原有代码不变
         cfg = dict(self.cfg)
         cfg['hist_patterns'] = self.hist_patterns
 
@@ -152,21 +228,22 @@ class Experiment:
                 'mre': torch_metrics.MaskedMRE()
             }
         ).to(self.device)
-        # 【关键修复1：强制模型转移到目标设备】
         self.model = self.model.to(self.device)
-        # 验证：打印模型设备，确保在cuda:0上（可选，用于调试）
-        print(f"Model device: {next(self.model.parameters()).device}")  # 应输出cuda:0
-        # 遍历所有buffer，验证设备（可选，用于调试）
+        print(f"Model device: {next(self.model.parameters()).device}")
         for name, buf in self.model.named_buffers():
             if buf.device != self.device:
                 print(f"Warning: Buffer {name} is on {buf.device}, moving to {self.device}")
-                buf.data = buf.data.to(self.device)  # 手动强制转移（防止注册失败）
-            logger = TensorBoardLogger(
-                save_dir='./logs',
-                name=f'{self.dataset}_imputation_{time.strftime("%Y%m%d_%H%M%S")}'
-            )
+                buf.data = buf.data.to(self.device)
+
+        logger = TensorBoardLogger(
+            save_dir='./logs',
+            name=f'{self.dataset}_imputation_{time.strftime("%Y%m%d_%H%M%S")}'
+        )
+
         if hasattr(self.model, 'side_info'):
+            model_device = next(self.model.parameters()).device
             self.model.side_info = self.model.side_info.to(model_device)
+
         self.callbacks = [
             ModelCheckpoint(
                 monitor='val_loss',
@@ -192,7 +269,6 @@ class Experiment:
         )
 
     def move_scaler_to_device(self, scaler, device):
-        # 保持原有代码不变
         if hasattr(scaler, 'bias') and isinstance(scaler.bias, torch.Tensor):
             scaler.bias = scaler.bias.to(device, non_blocking=True)
         if hasattr(scaler, 'scale') and isinstance(scaler.scale, torch.Tensor):
@@ -200,7 +276,6 @@ class Experiment:
         return scaler
 
     def _recursive_move_to_device(self, obj, device):
-        # 保持原有代码不变
         if isinstance(obj, Data):
             data = obj.clone()
             for key in data.keys():
@@ -223,45 +298,43 @@ class Experiment:
             return obj
 
     def _get_sample_data(self, dataloader, is_train=True, sample_idx=0, max_timesteps=None):
-        """
-        提取样本数据，支持指定最大时间步数量
-        max_timesteps: 最大时间步数量，None则使用完整序列
-        """
+        # 对测试集数据加载器应用替换包装器
+        if not is_train and self.replace_test_node:
+            dataloader = self._wrap_dataloader_for_replacement(dataloader)
+
         # 获取批次数据
         batch = next(iter(dataloader))
+
+        # 确保数据格式正确（处理可能的列表类型）
+        if isinstance(batch, list) and len(batch) > 0:
+            batch = batch[0]
+
         batch = create_interpolation(batch)
         batch = self._recursive_move_to_device(batch, self.device)
 
-        # 同步scaler到设备
         if hasattr(batch, 'transform'):
             if 'x' in batch.transform:
                 batch.transform['x'] = self.move_scaler_to_device(batch.transform['x'], self.device)
             if 'y' in batch.transform:
                 batch.transform['y'] = self.move_scaler_to_device(batch.transform['y'], self.device)
 
-        # 生成补全结果
         with torch.no_grad():
             if is_train:
                 imputed = self.model.get_imputation(batch)
             else:
                 imputed = self.model.generate_median_imputation(batch)
 
-        # 移动到CPU处理
         batch_cpu = self._recursive_move_to_device(batch, torch.device('cpu'))
         imputed_cpu = imputed.cpu().numpy()
 
-        # 提取样本数据
         x_raw = np.squeeze(batch_cpu.input.x[sample_idx].numpy())
         mask = np.squeeze(batch_cpu.input.mask[sample_idx].numpy())
         y_true = np.squeeze(batch_cpu.target.y[sample_idx].numpy())
         imputed_data = np.squeeze(imputed_cpu)[sample_idx]
-        print(y_true.shape)
-        # 【关键修改1：限制或扩展时间步数量】
+
         total_timesteps = y_true.shape[0]
-        print(total_timesteps)
         if max_timesteps is not None and max_timesteps < total_timesteps:
-            # 如果指定了最大时间步且小于总长度，则取一段连续的长序列
-            start_idx = 0  # 从起始位置开始
+            start_idx = 0
             end_idx = start_idx + max_timesteps
             x_raw = x_raw[start_idx:end_idx]
             mask = mask[start_idx:end_idx]
@@ -269,7 +342,6 @@ class Experiment:
             imputed_data = imputed_data[start_idx:end_idx]
             time_steps = np.arange(start_idx, end_idx)
         else:
-            # 使用完整序列
             time_steps = np.arange(total_timesteps)
 
         return {
@@ -279,29 +351,20 @@ class Experiment:
         }
 
     def _plot_visualization(self, sample_data, node_idx=0, save_path=None, tick_interval=None):
-        """
-        可视化函数，优化时间轴显示以适应更多时间步
-        tick_interval: 时间轴刻度间隔，None则自动计算
-        """
-        # 提取节点数据
         time_steps = sample_data['time_steps']
         x_raw = sample_data['x_raw'][:, node_idx] if sample_data['x_raw'].ndim > 1 else sample_data['x_raw']
         mask = sample_data['mask'][:, node_idx] if sample_data['mask'].ndim > 1 else sample_data['mask']
         y_true = sample_data['y_true'][:, node_idx] if sample_data['y_true'].ndim > 1 else sample_data['y_true']
         imputed = sample_data['imputed'][:, node_idx] if sample_data['imputed'].ndim > 1 else sample_data['imputed']
 
-        # 分离数据类型
         existing_data = np.where(mask == 1, y_true, np.nan)
         missing_true = np.where(mask == 0, y_true, np.nan)
         missing_imputed = np.where(mask == 0, imputed, np.nan)
 
-        # 计算缺失区域MAE
         missing_mae = np.nanmean(np.abs(missing_true - missing_imputed))
 
-        # 【关键修改2：根据时间步数量动态调整图像宽度】
         num_timesteps = len(time_steps)
-        # 时间步越多，图像宽度越大（但限制最大宽度为16）
-        fig_width = min(8 + num_timesteps / 50, 16)  # 每50个时间步增加1单位宽度
+        fig_width = min(8 + num_timesteps / 50, 16)
         fig, ax = plt.subplots(figsize=(fig_width, 4))
 
         phase = "Training" if sample_data['is_train'] else "Testing"
@@ -310,7 +373,6 @@ class Experiment:
             fontsize=9, pad=10
         )
 
-        # 绘制数据曲线
         ax.plot(time_steps, existing_data, 'o-', color='#1f77b4', alpha=0.7,
                 markersize=2, linewidth=1, label='Original', zorder=3)
         ax.plot(time_steps, missing_true, 'x--', color='#ff7f0e', alpha=0.7,
@@ -318,18 +380,14 @@ class Experiment:
         ax.plot(time_steps, missing_imputed, '^-', color='#2ca02c', alpha=0.7,
                 markersize=2.5, linewidth=0.9, label='Imputed', zorder=5)
 
-        # 标记缺失区域
         missing_indices = np.where(mask == 0)[0]
         for i in missing_indices:
             ax.axvspan(i - 0.5, i + 0.5, color='#f0f0f0', alpha=0.5, zorder=1)
 
-        # 【关键修改3：优化时间轴刻度显示】
         ax.set_xlabel('Time Step', fontsize=7, labelpad=5)
         ax.set_ylabel('Value', fontsize=7, labelpad=5)
 
-        # 自动计算合适的刻度间隔，避免刻度拥挤
         if tick_interval is None:
-            # 根据时间步数量动态调整间隔
             if num_timesteps <= 50:
                 tick_interval = 5
             elif num_timesteps <= 200:
@@ -339,16 +397,13 @@ class Experiment:
             else:
                 tick_interval = 100
 
-        # 设置x轴刻度
         ax.set_xticks(np.arange(min(time_steps), max(time_steps) + 1, tick_interval))
-        # 旋转刻度标签，避免重叠
         plt.xticks(rotation=45, ha='right', fontsize=6)
 
         ax.legend(loc='upper right', fontsize=6, frameon=False)
         ax.grid(True, alpha=0.2, linewidth=0.5)
         ax.set_xlim(min(time_steps) - 0.5, max(time_steps) + 0.5)
 
-        # 保存图像
         if save_path:
             save_path.parent.mkdir(parents=True, exist_ok=True)
             plt.tight_layout(pad=0.5)
@@ -366,20 +421,16 @@ class Experiment:
         plt.close(fig)
 
     def generate_visualizations(self, num_nodes=3, sample_idx=0, target_timesteps=300):
-        """
-        生成可视化时指定目标时间步数量
-        target_timesteps: 希望展示的时间步数量
-        """
         save_dir = Path(f'./visualizations/{self.dataset}_{time.strftime("%Y%m%d_%H%M%S")}')
         save_dir.mkdir(parents=True, exist_ok=True)
 
+        # 训练集可视化
         print(f"\nGenerating training visualizations with {target_timesteps} timesteps...")
-        # 【关键修改4：生成时指定目标时间步】
         train_data = self._get_sample_data(
             self.train_dataloader,
             is_train=True,
             sample_idx=sample_idx,
-            max_timesteps=target_timesteps  # 传递目标时间步参数
+            max_timesteps=target_timesteps
         )
         for node_idx in range(num_nodes):
             self._plot_visualization(
@@ -388,6 +439,7 @@ class Experiment:
                 save_path=save_dir / f'train_node_{node_idx}.png'
             )
 
+        # 测试集可视化（使用已替换节点后的数据）
         print(f"Generating testing visualizations with {target_timesteps} timesteps...")
         test_data = self._get_sample_data(
             self.test_dataloader,
@@ -405,20 +457,26 @@ class Experiment:
         print(f"Visualizations directory: {save_dir}")
 
     def run(self):
-        # 保持原有代码不变
         try:
-            self.prepare_data()
+            self.prepare_data()  # 保持原始test_dataloader格式
+
+            # 对测试集加载器进行包装以实现节点替换，但保持其原始类型
+            if self.replace_test_node:
+                self.test_dataloader = self._wrap_dataloader_for_replacement(self.test_dataloader)
+
             self.prepare_optimizer()
             self.prepare_model()
-            self.generate_visualizations(num_nodes=3)
             print("\nStarting training...")
+            self.generate_visualizations(num_nodes=10)
             train_start = time.time()
             self.trainer.fit(self.model, self.train_dataloader, self.val_dataloader)
             train_duration = time.time() - train_start
             print(f"Training done in {train_duration:.2f}s")
-            self.prepare_model()
-            self.generate_visualizations(num_nodes=3)
+            self.model = self.model.to(self.device)
+
             print("\nStarting evaluation...")
+            self.model = self.model.to(self.device)
+            self.generate_visualizations(num_nodes=10)
             checkpoint_callback = self.callbacks[0]
             if checkpoint_callback.best_model_path:
                 print(f"Loading best model: {checkpoint_callback.best_model_path}")
@@ -426,11 +484,12 @@ class Experiment:
 
             self.model.freeze()
             test_start = time.time()
+            # 评估时使用的是保持原始格式但已替换节点的test_dataloader
             results = self.trainer.test(self.model, self.test_dataloader)
             test_duration = time.time() - test_start
             print(f"Evaluation done in {test_duration:.2f}s")
-
-            # self.generate_visualizations(num_nodes=3)
+            self.model = self.model.to(self.device)
+            self.generate_visualizations(num_nodes=10)
 
             results[0]['training_time'] = train_duration
             results[0]['testing_time'] = test_duration
@@ -529,4 +588,3 @@ class AverageExperiment:
             self.save_results(results, i)
 
         self.average_results()
-
