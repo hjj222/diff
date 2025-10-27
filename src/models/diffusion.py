@@ -60,7 +60,19 @@ class DiffusionImputer(Imputer):
             seq_len=model_hyperparams['time_steps']
         )
 
-        print_summary_model(self.model, model_hyperparams)
+        # print_summary_model(self.model, model_hyperparams)
+
+    def temporal_smoothness(self, pred, mask):
+        """时间维度上的平滑性约束"""
+        if pred.shape[1] <= 1:
+            return torch.tensor(0.0).to(pred.device)
+
+        # 计算相邻时间步的差异
+        time_diff = pred[:, 1:] - pred[:, :-1]
+        mask_diff = mask[:, 1:] & mask[:, :-1]  # 只在两个时间步都有值的位置计算
+
+        smooth_loss = torch.mean((time_diff ** 2) * mask_diff)
+        return smooth_loss
 
     def get_imputation(self, batch):
         mask_co = batch.mask
@@ -83,7 +95,9 @@ class DiffusionImputer(Imputer):
 
         noise_pred = self.model(x_ta_t, cond_info['x_co'], cond_info['mask_co'], t)
 
-        return self.loss_fn(noise, noise_pred, mask_ta)
+        return 0.8 * self.loss_fn(noise, noise_pred, mask_ta) + 0.1 * self.masked_mae(noise, noise_pred,
+                                                                                      mask_ta) + 0.1 * self.temporal_smoothness(
+            noise_pred, mask_ta)
 
     def training_step(self, batch, batch_idx):
         loss = self.calculate_loss(batch)

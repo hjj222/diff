@@ -273,7 +273,7 @@ class HdMixer1(nn.Module):
 
         # 设置补丁参数
         self.patch_len = 4
-        self.stride = 4
+        self.stride =4
         context_window = 24
         self.patch_num = context_window // self.stride
 
@@ -330,52 +330,6 @@ class HdMixer1(nn.Module):
             align_corners=False
         ).squeeze(1)  # B*C, self.patch_num, self.patch_len
         return x
-
-    class HdMixer2(nn.Module):
-        def __init__(self, time_steps, num_nodes, channels):
-            super().__init__()
-            self.channels = channels
-            self.num_nodes = num_nodes
-            self.time_steps = time_steps
-            self.patch_len = 207
-            self.stride = 207
-            context_window = 24 * 207
-            self.patch_num = context_window // self.stride
-            self.patch_shift_linear = nn.Linear(207 * 24, self.patch_num * 3)
-            self.embed_layer = nn.Embedding(num_embeddings=self.num_nodes, embedding_dim=16)
-            self.n_vars = 2
-            self.box_coder = pointwhCoder(input_size=context_window, patch_count=self.patch_num, weights=(1., 1., 1.),
-                                          pts=self.patch_len, tanh=True, wh_bias=torch.tensor(5. / 3.).sqrt().log(),
-                                          deform_range=1)
-
-        def forward(self, x):
-            B, _, K, L = x.shape
-            batch_size = x.shape[0]
-            x = x.reshape(B, _, K * L)
-            seq_len = x.shape[-1]
-
-            anchor_shift = self.patch_shift_linear(x).view(batch_size * self.n_vars, self.patch_num, 3)
-            sampling_location_1d = self.box_coder(anchor_shift)  # [B*C, patch_num, patch_len, 1]
-
-            # 转换为整数索引并限制范围
-            sampling_indices = sampling_location_1d.squeeze(-1).long()  # [B*C, patch_num, patch_len]
-            sampling_indices = torch.clamp(sampling_indices, 0, seq_len - 1)
-
-            # 重塑输入用于索引 [B*C, seq_len]
-            x_flat = x.reshape(batch_size * self.n_vars, seq_len)
-
-            # 使用 gather 进行批量索引提取
-            # 扩展维度以便使用 gather
-            batch_indices = torch.arange(batch_size * self.n_vars, device=x.device)
-            batch_indices = batch_indices.view(-1, 1, 1).expand(-1, self.patch_num, self.patch_len)
-
-            # 提取补丁 [B*C, patch_num, patch_len]
-            patch = x_flat[batch_indices, sampling_indices]
-
-            # 重新组织补丁结构 [B, n_vars, patch_len, patch_num]
-            x = patch.reshape(batch_size, self.n_vars, self.patch_num, self.patch_len).permute(0, 1, 3, 2)
-
-            return x
 
 
 class NoiseProject(nn.Module):
