@@ -60,7 +60,7 @@ class DiffusionImputer(Imputer):
             seq_len=model_hyperparams['time_steps']
         )
 
-        # print_summary_model(self.model, model_hyperparams)
+        print_summary_model(self.model, model_hyperparams)
 
     def temporal_smoothness(self, pred, mask):
         """时间维度上的平滑性约束"""
